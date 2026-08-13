@@ -44,14 +44,32 @@ class ErrorResponse(BaseModel):
 # =========================================================
 
 class SentenceLLMOutput(BaseModel):
-    sentiment: Literal["Positive", "Negative", "Neutral"] = Field(
-        description="Sentiment of this sentence"
+    sentiment: str = Field(
+        description=(
+            "Sentiment label. Prefer Positive, Negative, "
+            "or Neutral. Do not use emotion names as sentiment."
+        )
     )
+
     emotion: str = Field(
-        description="Primary emotion, e.g. frustration, joy, confusion, calm, anger, satisfaction"
+        description=(
+            "Primary emotion such as frustration, "
+            "satisfaction, confusion, anger, calm, "
+            "gratitude, surprise, relief."
+        )
     )
-    confidence: float = Field(ge=0, le=1, description="Confidence score between 0 and 1")
-    reasoning: str = Field(description="One short sentence explaining the classification")
+
+    confidence: float = Field(
+        ge=0,
+        le=1,
+        description="Confidence between 0 and 1.",
+    )
+
+    reasoning: str = Field(
+        description=(
+            "One very short factual explanation."
+        )
+    )
 
 
 class SentenceListLLMOutput(BaseModel):

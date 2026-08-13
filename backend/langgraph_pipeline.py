@@ -1,20 +1,21 @@
 import os
 import re
 import time
-import json
-from typing import TypedDict, List, Dict, Optional, Any
+from typing import Any, Dict, List, Optional, TypedDict
 
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 
-from models import SentenceListLLMOutput, KPILLMOutput
 from logger_config import get_logger
+from models import KPILLMOutput, SentenceListLLMOutput
 
 logger = get_logger("langgraph_pipeline")
 
+MAX_ANALYSIS_UNITS = int(os.getenv("MAX_ANALYSIS_UNITS", "120"))
+
 
 # =========================================================
-# LLM Provider Factory (swappable via LLM_PROVIDER env var)
+# LLM Provider
 # =========================================================
 
 def get_llm(temperature: float = 0.0):
@@ -22,25 +23,47 @@ def get_llm(temperature: float = 0.0):
 
     if provider == "groq":
         from langchain_groq import ChatGroq
+
+        api_key = os.getenv("GROQ_API_KEY")
+
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not configured.")
+
         return ChatGroq(
-            model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            model=os.getenv(
+                "GROQ_MODEL",
+                "llama-3.3-70b-versatile",
+            ),
             temperature=temperature,
-            api_key=os.getenv("GROQ_API_KEY"),
+            api_key=api_key,
         )
 
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
+
+        api_key = os.getenv("GEMINI_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not configured."
+            )
+
         return ChatGoogleGenerativeAI(
-            model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+            model=os.getenv(
+                "GEMINI_MODEL",
+                "gemini-1.5-flash",
+            ),
             temperature=temperature,
-            google_api_key=os.getenv("GEMINI_API_KEY"),
+            google_api_key=api_key,
         )
 
-    raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER: {provider}"
+    )
 
 
 # =========================================================
-# Shared LangGraph State
+# LangGraph State
 # =========================================================
 
 class GraphState(TypedDict):
@@ -56,311 +79,829 @@ class GraphState(TypedDict):
 
 
 # =========================================================
-# Helpers
+# Transcript parsing
 # =========================================================
 
-SPEAKER_LINE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 _\-]{0,30}?)\s*:\s*(.+)$")
+# Handles:
+# Agent:
+# Customer:
+# Agent -
+# Customer -
+# [Agent]:
+# [Customer]:
+# AGENT:
+# CUSTOMER:
+#
+# The parser intentionally does NOT require the speaker to be
+# exactly "Agent" or "Customer", because transcripts can contain
+# names such as "Rahul", "Support Executive", etc.
+SPEAKER_LINE_RE = re.compile(
+    r"""
+    ^\s*
+    (?:\[(?P<bracket>[^\]]{1,40})\]|(?P<plain>[A-Za-z][A-Za-z0-9 _/&\-]{0,39}))
+    \s*(?::|-)\s*
+    (?P<text>.+?)\s*$
+    """,
+    re.VERBOSE,
+)
+
+# Timestamp prefixes that frequently appear in call transcripts.
+TIMESTAMP_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        \[\d{1,2}:\d{2}(?::\d{2})?\]
+        |
+        \d{1,2}:\d{2}(?::\d{2})?
+        |
+        \d{1,2}:\d{2}(?:\s*[APMapm]{2})
+    )
+    \s*[-:|]?\s*
+    """,
+    re.VERBOSE,
+)
+
+# Used only for actual sentence boundaries. This is deliberately
+# conservative because transcripts contain abbreviations, decimals,
+# names, URLs, etc.
+SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?।])\s+(?=[A-Z0-9\u0900-\u097F])"
+)
 
 
-def split_sentences(text: str) -> List[str]:
-    text = text.strip()
+def clean_line(line: str) -> str:
+    line = line.replace("\x00", "")
+    line = TIMESTAMP_RE.sub("", line.strip())
+
+    # Remove excessive whitespace while keeping the actual content.
+    line = re.sub(r"[ \t]+", " ", line)
+
+    return line.strip()
+
+
+def parse_speaker(line: str) -> tuple[Optional[str], Optional[str]]:
+    match = SPEAKER_LINE_RE.match(line)
+
+    if not match:
+        return None, None
+
+    speaker = (
+        match.group("bracket")
+        or match.group("plain")
+        or ""
+    ).strip()
+
+    text = match.group("text").strip()
+
+    if not speaker or not text:
+        return None, None
+
+    return speaker, text
+
+
+def smart_split_text(text: str) -> List[str]:
+    """
+    Split an utterance into analysis units without aggressively
+    fragmenting natural conversational text.
+
+    Important:
+    We prefer one short utterance over dozens of artificial fragments.
+    """
+
+    text = re.sub(r"\s+", " ", text.strip())
+
     if not text:
         return []
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+
+    # If punctuation exists, use conservative sentence boundaries.
+    pieces = SENTENCE_BOUNDARY_RE.split(text)
+
+    cleaned = [
+        piece.strip()
+        for piece in pieces
+        if piece.strip()
+    ]
+
+    # If nothing useful was split, retain the full utterance.
+    return cleaned or [text]
+
+
+def parse_transcript(
+    raw_text: str,
+) -> List[Dict[str, Optional[str]]]:
+    """
+    Smart parser for imperfect real-world transcripts.
+
+    Strategy:
+    - detect speaker labels when available
+    - preserve continuation lines
+    - remove timestamps
+    - split only at conservative sentence boundaries
+    - preserve speaker identity
+    """
+
+    lines = [
+        clean_line(line)
+        for line in raw_text.splitlines()
+        if line.strip()
+    ]
+
+    turns: List[Dict[str, Optional[str]]] = []
+
+    current_speaker: Optional[str] = None
+    current_text_parts: List[str] = []
+
+    def flush_current_turn() -> None:
+        nonlocal current_text_parts
+
+        if not current_text_parts:
+            return
+
+        combined_text = " ".join(
+            part.strip()
+            for part in current_text_parts
+            if part.strip()
+        ).strip()
+
+        if not combined_text:
+            current_text_parts = []
+            return
+
+        for sentence in smart_split_text(
+            combined_text
+        ):
+            turns.append(
+                {
+                    "speaker": current_speaker,
+                    "text": sentence,
+                }
+            )
+
+        current_text_parts = []
+
+    for line in lines:
+        speaker, text = parse_speaker(line)
+
+        if speaker is not None:
+            # New speaker = finish the previous utterance.
+            flush_current_turn()
+
+            current_speaker = speaker
+            current_text_parts = [text]
+
+        else:
+            # Continuation line.
+            current_text_parts.append(line)
+
+    flush_current_turn()
+
+    return turns
+
+
+# =========================================================
+# Normalization helpers
+# =========================================================
+
+def normalize_sentiment(value: str) -> str:
+    """
+    Convert model drift such as:
+        surprised
+        happy
+        angry
+        mixed
+    into the contractual API labels.
+    """
+
+    normalized = (
+        str(value)
+        .strip()
+        .lower()
+    )
+
+    if normalized in {
+        "positive",
+        "pos",
+        "good",
+        "happy",
+        "satisfied",
+        "grateful",
+        "relieved",
+    }:
+        return "Positive"
+
+    if normalized in {
+        "negative",
+        "neg",
+        "bad",
+        "angry",
+        "frustrated",
+        "upset",
+        "dissatisfied",
+        "sad",
+    }:
+        return "Negative"
+
+    # Surprise, confusion and politeness are not inherently
+    # positive or negative.
+    return "Neutral"
+
+
+def normalize_emotion(value: str) -> str:
+    value = str(value).strip()
+
+    return value[:60] if value else "neutral"
+
+
+def normalize_reasoning(value: str) -> str:
+    value = re.sub(
+        r"\s+",
+        " ",
+        str(value).strip(),
+    )
+
+    return value[:220] if value else "No reasoning provided."
 
 
 # =========================================================
 # Node 1: parse_transcript
 # =========================================================
 
-def parse_transcript_node(state: GraphState) -> Dict[str, Any]:
-    rid = state.get("request_id", "unknown")
+def parse_transcript_node(
+    state: GraphState,
+) -> Dict[str, Any]:
+
+    rid = state.get(
+        "request_id",
+        "unknown",
+    )
+
     start = time.perf_counter()
-    logger.info(f"[{rid}] NODE START -> parse_transcript")
 
-    raw_text = state["raw_text"]
-    lines = [l for l in raw_text.splitlines() if l.strip()]
+    logger.info(
+        f"[{rid}] NODE START -> parse_transcript"
+    )
 
-    turns: List[Dict[str, Optional[str]]] = []
-    for line in lines:
-        match = SPEAKER_LINE_RE.match(line)
-        if match:
-            speaker, text = match.group(1).strip(), match.group(2).strip()
-            for sentence in split_sentences(text):
-                turns.append({"speaker": speaker, "text": sentence})
-        else:
-            for sentence in split_sentences(line):
-                turns.append({"speaker": None, "text": sentence})
+    try:
+        turns = parse_transcript(
+            state["raw_text"]
+        )
+    except Exception:
+        logger.exception(
+            f"[{rid}] Transcript parsing failed"
+        )
 
-    duration = round(time.perf_counter() - start, 3)
+        return {
+            "turns": [],
+            "error": "Unable to parse the transcript.",
+        }
+
+    duration = round(
+        time.perf_counter() - start,
+        3,
+    )
 
     if not turns:
-        logger.error(f"[{rid}] NODE FAILED -> parse_transcript | no sentences parsed | {duration}s")
-        return {"turns": [], "error": "No valid sentences could be parsed from the transcript."}
+        return {
+            "turns": [],
+            "error": (
+                "No usable conversational content "
+                "was found in the transcript."
+            ),
+        }
 
-    logger.info(f"[{rid}] NODE END -> parse_transcript | {len(turns)} sentences extracted | {duration}s")
-    logger.info(f"[{rid}] parse_transcript OUTPUT:\n{json.dumps(turns, indent=2)}")
+    if len(turns) > MAX_ANALYSIS_UNITS:
+        logger.warning(
+            f"[{rid}] Analysis unit count "
+            f"{len(turns)} exceeds limit "
+            f"{MAX_ANALYSIS_UNITS}"
+        )
 
-    return {"turns": turns}
+        return {
+            "turns": [],
+            "error": (
+                f"Transcript is too granular for analysis. "
+                f"Please provide a transcript with fewer than "
+                f"{MAX_ANALYSIS_UNITS} analysis units."
+            ),
+        }
+
+    labeled = sum(
+        1
+        for turn in turns
+        if turn["speaker"]
+    )
+
+    logger.info(
+        f"[{rid}] NODE END -> parse_transcript | "
+        f"analysis_units={len(turns)} "
+        f"labeled={labeled} | {duration}s"
+    )
+
+    return {
+        "turns": turns
+    }
 
 
 # =========================================================
-# Node 2: sentence_sentiment (LLM call #1)
+# Node 2: sentence_sentiment
+# LLM call #1
 # =========================================================
 
-def sentence_sentiment_node(state: GraphState) -> Dict[str, Any]:
-    rid = state.get("request_id", "unknown")
+def sentence_sentiment_node(
+    state: GraphState,
+) -> Dict[str, Any]:
+
+    rid = state.get(
+        "request_id",
+        "unknown",
+    )
+
     if state.get("error"):
         return {}
 
     start = time.perf_counter()
+
     turns = state["turns"]
-    logger.info(f"[{rid}] NODE START -> sentence_sentiment | {len(turns)} sentences to analyze")
+
+    logger.info(
+        f"[{rid}] NODE START -> sentence_sentiment | "
+        f"units={len(turns)}"
+    )
 
     numbered = "\n".join(
-        f"{i + 1}. [{t['speaker'] or 'Unknown'}] {t['text']}" for i, t in enumerate(turns)
+        (
+            f"{index + 1}. "
+            f"[{turn['speaker'] or 'Unknown'}] "
+            f"{turn['text']}"
+        )
+        for index, turn in enumerate(turns)
     )
 
-    system_prompt = (
-        "You are an expert call-center conversation analyst. For each numbered sentence "
-        "below, determine its sentiment (Positive, Negative, or Neutral), its primary "
-        "emotion (e.g. frustration, satisfaction, anger, confusion, calm, gratitude), "
-        "a confidence score between 0.0 and 1.0, and a short one-sentence reasoning. "
-        "You MUST return exactly one result per input sentence, in the exact same order. "
-        "The number of results must match the number of input sentences."
+    system_prompt = """
+You are an expert call-center conversation analyst.
+
+Analyze every numbered conversational unit.
+
+For each unit return:
+- sentiment: Positive, Negative, or Neutral
+- emotion: one concise primary emotion
+- confidence: 0.0 to 1.0
+- reasoning: one very short factual sentence
+
+IMPORTANT:
+- "Surprised", "Confused", "Polite", "Urgent", etc.
+  are EMOTIONS, not sentiment labels.
+- Sentiment MUST be exactly Positive, Negative, or Neutral.
+- Surprise alone is Neutral unless the wording itself is
+  clearly positive or negative.
+- Greeting, acknowledgement, information gathering,
+  clarification and farewell are normally Neutral.
+- Preserve the input order.
+- Return exactly one result per input unit.
+- Never invent or omit a unit.
+- Keep reasoning concise.
+""".strip()
+
+    human_prompt = (
+        "CONVERSATIONAL UNITS:\n\n"
+        f"{numbered}"
     )
-    human_prompt = f"Sentences:\n{numbered}"
 
-    logger.info(f"[{rid}] LLM CALL #1 (sentence_sentiment) PROMPT:\n{human_prompt}")
-
-    llm = get_llm(temperature=0)
-    structured_llm = llm.with_structured_output(SentenceListLLMOutput)
+    logger.info(
+        f"[{rid}] LLM CALL #1 START -> sentence_sentiment"
+    )
 
     try:
-        parsed: SentenceListLLMOutput = structured_llm.invoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"[{rid}] LLM CALL #1 FAILED (sentence_sentiment): {exc}")
-        return {"error": f"LLM sentiment analysis failed: {exc}"}
+        llm = get_llm(temperature=0)
 
-    duration = round(time.perf_counter() - start, 3)
-    raw_dump = [r.model_dump() for r in parsed.results]
-    logger.info(
-        f"[{rid}] LLM CALL #1 RESPONSE (sentence_sentiment) | "
-        f"{len(raw_dump)} results | {duration}s\n{json.dumps(raw_dump, indent=2)}"
+        structured_llm = llm.with_structured_output(
+            SentenceListLLMOutput
+        )
+
+        parsed: SentenceListLLMOutput = (
+            structured_llm.invoke(
+                [
+                    SystemMessage(
+                        content=system_prompt
+                    ),
+                    HumanMessage(
+                        content=human_prompt
+                    ),
+                ]
+            )
+        )
+
+    except Exception:
+        logger.exception(
+            f"[{rid}] LLM CALL #1 FAILED -> "
+            f"sentence_sentiment"
+        )
+
+        return {
+            "error": (
+                "Sentence-level sentiment analysis "
+                "failed. The model could not return "
+                "a valid analysis."
+            )
+        }
+
+    results = parsed.results
+
+    # NEVER silently align mismatched results.
+    if len(results) != len(turns):
+        logger.error(
+            f"[{rid}] LLM CALL #1 INVALID COUNT | "
+            f"expected={len(turns)} "
+            f"received={len(results)}"
+        )
+
+        return {
+            "error": (
+                "The sentiment model returned an "
+                "incomplete analysis."
+            )
+        }
+
+    sentence_results: List[
+        Dict[str, Any]
+    ] = []
+
+    for turn, result in zip(
+        turns,
+        results,
+    ):
+        sentence_results.append(
+            {
+                "text": turn["text"],
+                "speaker": turn["speaker"],
+                "sentiment": normalize_sentiment(
+                    result.sentiment
+                ),
+                "emotion": normalize_emotion(
+                    result.emotion
+                ),
+                "confidence": max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            result.confidence
+                        ),
+                    ),
+                ),
+                "reasoning": normalize_reasoning(
+                    result.reasoning
+                ),
+            }
+        )
+
+    duration = round(
+        time.perf_counter() - start,
+        3,
     )
 
-    llm_results = parsed.results
-    sentence_results: List[Dict[str, Any]] = []
+    logger.info(
+        f"[{rid}] LLM CALL #1 END -> "
+        f"sentence_sentiment | "
+        f"results={len(sentence_results)} | "
+        f"{duration}s"
+    )
 
-    for i, turn in enumerate(turns):
-        if i < len(llm_results):
-            r = llm_results[i]
-            sentence_results.append(
-                {
-                    "text": turn["text"],
-                    "speaker": turn["speaker"],
-                    "sentiment": r.sentiment,
-                    "emotion": r.emotion,
-                    "confidence": r.confidence,
-                    "reasoning": r.reasoning,
-                }
-            )
-        else:
-            logger.warning(
-                f"[{rid}] sentence_sentiment: missing LLM result for sentence #{i+1}, using fallback"
-            )
-            sentence_results.append(
-                {
-                    "text": turn["text"],
-                    "speaker": turn["speaker"],
-                    "sentiment": "Neutral",
-                    "emotion": "unknown",
-                    "confidence": 0.5,
-                    "reasoning": "No analysis returned by the model for this sentence.",
-                }
-            )
-
-    logger.info(f"[{rid}] NODE END -> sentence_sentiment | {duration}s")
-
-    return {"sentence_results": sentence_results}
+    return {
+        "sentence_results": sentence_results
+    }
 
 
 # =========================================================
-# Node 3: aggregate_overall (pure computation, no LLM)
+# Node 3: aggregate_overall
+# Pure Python — no LLM
 # =========================================================
 
-def aggregate_overall_node(state: GraphState) -> Dict[str, Any]:
-    rid = state.get("request_id", "unknown")
+def aggregate_overall_node(
+    state: GraphState,
+) -> Dict[str, Any]:
+
+    rid = state.get(
+        "request_id",
+        "unknown",
+    )
+
     if state.get("error"):
         return {}
 
-    start = time.perf_counter()
-    logger.info(f"[{rid}] NODE START -> aggregate_overall")
+    results = state[
+        "sentence_results"
+    ]
 
-    results = state["sentence_results"]
     if not results:
-        logger.warning(f"[{rid}] aggregate_overall: no sentence results, defaulting to Neutral")
-        return {"overall_sentiment": "Neutral", "overall_confidence": 0.0}
+        return {
+            "overall_sentiment": "Neutral",
+            "overall_confidence": 0.0,
+        }
 
-    score_map = {"Positive": 1, "Neutral": 0, "Negative": -1}
-    weighted_sum = sum(score_map[r["sentiment"]] * r["confidence"] for r in results)
-    total_confidence = sum(r["confidence"] for r in results) or 1.0
-    avg_score = weighted_sum / total_confidence
+    score_map = {
+        "Positive": 1.0,
+        "Neutral": 0.0,
+        "Negative": -1.0,
+    }
 
-    if avg_score > 0.15:
-        overall = "Positive"
-    elif avg_score < -0.15:
-        overall = "Negative"
-    else:
-        overall = "Neutral"
-
-    overall_confidence = round(sum(r["confidence"] for r in results) / len(results), 3)
-    duration = round(time.perf_counter() - start, 3)
-
-    logger.info(
-        f"[{rid}] NODE END -> aggregate_overall | overall_sentiment={overall} "
-        f"avg_score={round(avg_score, 3)} confidence={overall_confidence} | {duration}s"
+    weighted_sum = sum(
+        score_map[
+            result["sentiment"]
+        ]
+        * result["confidence"]
+        for result in results
     )
 
-    return {"overall_sentiment": overall, "overall_confidence": overall_confidence}
-
-
-# =========================================================
-# Node 4: kpi_extraction (LLM call #2)
-# =========================================================
-
-def kpi_extraction_node(state: GraphState) -> Dict[str, Any]:
-    rid = state.get("request_id", "unknown")
-    if state.get("error"):
-        return {}
-
-    start = time.perf_counter()
-    logger.info(f"[{rid}] NODE START -> kpi_extraction")
-
-    turns = state["turns"]
-    transcript_text = "\n".join(
-        f"{(t['speaker'] or 'Unknown')}: {t['text']}" for t in turns
-    )
-    sentiment_summary = "\n".join(
-        f"- ({r['speaker'] or 'Unknown'}) {r['sentiment']}/{r['emotion']}: {r['text']}"
-        for r in state["sentence_results"]
-    )
-
-    system_prompt = (
-        "You are a call-center quality assurance analyst. Based on the transcript and "
-        "the sentence-level sentiment analysis provided, extract objective call-center KPIs."
-    )
-    human_prompt = (
-        f"TRANSCRIPT:\n{transcript_text}\n\n"
-        f"SENTENCE-LEVEL SENTIMENT:\n{sentiment_summary}\n\n"
-        "Provide:\n"
-        "- csat_score_estimate: estimated customer satisfaction score (0-10)\n"
-        "- escalation_risk: Low, Medium, or High\n"
-        "- resolution_status: Resolved, Unresolved, or Follow-up needed\n"
-        "- agent_sentiment_avg: short phrase describing the agent's average tone\n"
-        "- customer_sentiment_avg: short phrase describing the customer's average tone\n"
-        "- sentiment_trend: Improving, Worsening, or Stable (comparing start vs end of call)\n"
-        "- politeness_score: how polite/professional the agent was (0-10)\n"
-        "- key_topics: up to 5 short topic keywords/phrases discussed in the call"
-    )
-
-    logger.info(f"[{rid}] LLM CALL #2 (kpi_extraction) PROMPT:\n{human_prompt}")
-
-    llm = get_llm(temperature=0)
-    structured_llm = llm.with_structured_output(KPILLMOutput)
-
-    try:
-        parsed: KPILLMOutput = structured_llm.invoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+    total_confidence = (
+        sum(
+            result["confidence"]
+            for result in results
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"[{rid}] LLM CALL #2 FAILED (kpi_extraction): {exc}")
-        return {"error": f"LLM KPI extraction failed: {exc}"}
-
-    duration = round(time.perf_counter() - start, 3)
-    kpi_dump = parsed.model_dump()
-    logger.info(
-        f"[{rid}] LLM CALL #2 RESPONSE (kpi_extraction) | {duration}s\n"
-        f"{json.dumps(kpi_dump, indent=2)}"
+        or 1.0
     )
 
-    logger.info(f"[{rid}] NODE END -> kpi_extraction | {duration}s")
+    average_score = (
+        weighted_sum
+        / total_confidence
+    )
 
-    return {"kpis": kpi_dump}
+    if average_score > 0.15:
+        sentiment = "Positive"
+    elif average_score < -0.15:
+        sentiment = "Negative"
+    else:
+        sentiment = "Neutral"
+
+    confidence = round(
+        sum(
+            result["confidence"]
+            for result in results
+        )
+        / len(results),
+        3,
+    )
+
+    logger.info(
+        f"[{rid}] NODE END -> "
+        f"aggregate_overall | "
+        f"sentiment={sentiment} "
+        f"confidence={confidence}"
+    )
+
+    return {
+        "overall_sentiment": sentiment,
+        "overall_confidence": confidence,
+    }
 
 
 # =========================================================
-# Node 5: summary_node (LLM call #3)
+# Node 4: KPI extraction
+# LLM call #2
 # =========================================================
 
-def summary_node(state: GraphState) -> Dict[str, Any]:
-    rid = state.get("request_id", "unknown")
+def kpi_extraction_node(
+    state: GraphState,
+) -> Dict[str, Any]:
+
+    rid = state.get(
+        "request_id",
+        "unknown",
+    )
+
     if state.get("error"):
         return {}
 
-    start = time.perf_counter()
-    logger.info(f"[{rid}] NODE START -> summary_node")
-
     turns = state["turns"]
+
     transcript_text = "\n".join(
-        f"{(t['speaker'] or 'Unknown')}: {t['text']}" for t in turns
+        f"{turn['speaker'] or 'Unknown'}: "
+        f"{turn['text']}"
+        for turn in turns
     )
 
-    llm = get_llm(temperature=0.3)
-    human_prompt = (
-        "Summarize the following call transcript in 2-3 sentences, "
-        "covering the customer's issue, what the agent did, and the outcome:\n\n"
-        f"{transcript_text}"
+    sentiment_summary = "\n".join(
+        (
+            f"- "
+            f"{result['speaker'] or 'Unknown'} | "
+            f"{result['sentiment']} | "
+            f"{result['emotion']} | "
+            f"{result['text']}"
+        )
+        for result in state[
+            "sentence_results"
+        ]
     )
 
-    logger.info(f"[{rid}] LLM CALL #3 (summary_node) PROMPT:\n{human_prompt}")
+    system_prompt = """
+You are a call-center quality analyst.
+
+Based only on the transcript and sentence-level
+analysis, extract objective call KPIs.
+
+Do not invent facts.
+Be conservative when evidence is ambiguous.
+""".strip()
+
+    human_prompt = f"""
+TRANSCRIPT:
+{transcript_text}
+
+SENTIMENT ANALYSIS:
+{sentiment_summary}
+
+Return:
+- csat_score_estimate: 0-10
+- escalation_risk: Low | Medium | High
+- resolution_status: Resolved | Unresolved | Follow-up needed
+- agent_sentiment_avg
+- customer_sentiment_avg
+- sentiment_trend: Improving | Worsening | Stable
+- politeness_score: 0-10
+- key_topics: maximum 5
+""".strip()
 
     try:
+        llm = get_llm(temperature=0)
+
+        structured_llm = llm.with_structured_output(
+            KPILLMOutput
+        )
+
+        parsed: KPILLMOutput = (
+            structured_llm.invoke(
+                [
+                    SystemMessage(
+                        content=system_prompt
+                    ),
+                    HumanMessage(
+                        content=human_prompt
+                    ),
+                ]
+            )
+        )
+
+    except Exception:
+        logger.exception(
+            f"[{rid}] LLM CALL #2 FAILED -> "
+            f"kpi_extraction"
+        )
+
+        return {
+            "error": "KPI extraction failed."
+        }
+
+    return {
+        "kpis": parsed.model_dump()
+    }
+
+
+# =========================================================
+# Node 5: summary
+# LLM call #3
+# =========================================================
+
+def summary_node(
+    state: GraphState,
+) -> Dict[str, Any]:
+
+    rid = state.get(
+        "request_id",
+        "unknown",
+    )
+
+    if state.get("error"):
+        return {}
+
+    transcript_text = "\n".join(
+        f"{turn['speaker'] or 'Unknown'}: "
+        f"{turn['text']}"
+        for turn in state["turns"]
+    )
+
+    system_prompt = """
+You are a professional call-center summarizer.
+
+Write a factual 2-3 sentence summary covering:
+1. customer's issue
+2. agent's action
+3. outcome
+
+Do not invent information.
+""".strip()
+
+    try:
+        llm = get_llm(
+            temperature=0.2
+        )
+
         response = llm.invoke(
             [
                 SystemMessage(
-                    content="You summarize call-center conversations concisely and factually."
+                    content=system_prompt
                 ),
-                HumanMessage(content=human_prompt),
+                HumanMessage(
+                    content=(
+                        "CALL TRANSCRIPT:\n"
+                        f"{transcript_text}"
+                    ),
+                ),
             ]
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"[{rid}] LLM CALL #3 FAILED (summary_node): {exc}")
-        return {"error": f"LLM summary generation failed: {exc}"}
 
-    duration = round(time.perf_counter() - start, 3)
-    summary_text = response.content.strip()
+    except Exception:
+        logger.exception(
+            f"[{rid}] LLM CALL #3 FAILED -> summary"
+        )
 
-    logger.info(
-        f"[{rid}] LLM CALL #3 RESPONSE (summary_node) | {duration}s\nSUMMARY: {summary_text}"
+        return {
+            "error": "Call summary generation failed."
+        }
+
+    summary = (
+        response.content
+        .strip()
     )
-    logger.info(f"[{rid}] NODE END -> summary_node | {duration}s")
 
-    return {"summary": summary_text}
+    if not summary:
+        return {
+            "error": "The summary model returned an empty response."
+        }
+
+    return {
+        "summary": summary
+    }
 
 
 # =========================================================
-# Graph Construction
+# Graph
 # =========================================================
 
 def build_graph():
-    graph = StateGraph(GraphState)
+    graph = StateGraph(
+        GraphState
+    )
 
-    graph.add_node("parse_transcript", parse_transcript_node)
-    graph.add_node("sentence_sentiment", sentence_sentiment_node)
-    graph.add_node("aggregate_overall", aggregate_overall_node)
-    graph.add_node("kpi_extraction", kpi_extraction_node)
-    graph.add_node("summary_node", summary_node)
+    graph.add_node(
+        "parse_transcript",
+        parse_transcript_node,
+    )
 
-    graph.add_edge(START, "parse_transcript")
-    graph.add_edge("parse_transcript", "sentence_sentiment")
-    graph.add_edge("sentence_sentiment", "aggregate_overall")
-    graph.add_edge("aggregate_overall", "kpi_extraction")
-    graph.add_edge("kpi_extraction", "summary_node")
-    graph.add_edge("summary_node", END)
+    graph.add_node(
+        "sentence_sentiment",
+        sentence_sentiment_node,
+    )
+
+    graph.add_node(
+        "aggregate_overall",
+        aggregate_overall_node,
+    )
+
+    graph.add_node(
+        "kpi_extraction",
+        kpi_extraction_node,
+    )
+
+    graph.add_node(
+        "summary_node",
+        summary_node,
+    )
+
+    graph.add_edge(
+        START,
+        "parse_transcript",
+    )
+
+    graph.add_edge(
+        "parse_transcript",
+        "sentence_sentiment",
+    )
+
+    graph.add_edge(
+        "sentence_sentiment",
+        "aggregate_overall",
+    )
+
+    # Independent branches.
+    graph.add_edge(
+        "aggregate_overall",
+        "kpi_extraction",
+    )
+
+    graph.add_edge(
+        "aggregate_overall",
+        "summary_node",
+    )
+
+    graph.add_edge(
+        "kpi_extraction",
+        END,
+    )
+
+    graph.add_edge(
+        "summary_node",
+        END,
+    )
 
     return graph.compile()
 

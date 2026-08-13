@@ -1,30 +1,55 @@
 import { AnalysisResponse } from "@/types";
+import { getSessionToken } from "@/lib/auth";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+export async function analyzeTranscript(
+  file: File
+): Promise<AnalysisResponse> {
+  const token = getSessionToken();
 
-export async function analyzeTranscript(file: File): Promise<AnalysisResponse> {
+  if (!token) {
+    throw new Error(
+      "Your session has expired. Please log in again."
+    );
+  }
+
   const formData = new FormData();
+
   formData.append("file", file);
 
-  const response = await fetch(`${API_URL}/analyze`, {
-    method: "POST",
-    headers: {
-      "X-API-Key": API_KEY,
-    },
-    body: formData,
-  });
+  const response = await fetch(
+    "/api/analyze",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      body: formData,
+      cache: "no-store",
+    }
+  );
 
   if (!response.ok) {
-    let detail = "Failed to analyze transcript.";
+    let detail =
+      "Failed to analyze transcript.";
+
     try {
-      const errBody = await response.json();
-      detail = errBody.detail || detail;
+      const errorBody = await response.json();
+
+      if (typeof errorBody?.detail === "string") {
+        detail = errorBody.detail;
+      }
     } catch {
-      // ignore parse errors
+      // Ignore malformed error payloads.
     }
+
+    if (response.status === 401) {
+      throw new Error(
+        "Your session has expired. Please log in again."
+      );
+    }
+
     throw new Error(detail);
   }
 
-  return response.json();
+  return response.json() as Promise<AnalysisResponse>;
 }
